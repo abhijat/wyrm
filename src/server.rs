@@ -4,7 +4,7 @@ use crate::connection::{
     connection_memory_findings, parse_client_info,
 };
 use crate::memory::{MemorySnapshot, parse_memory_info};
-use crate::metrics::{DefragSnapshot, MetricsCollector, parse_defrag_info, parse_defrag_snapshot};
+use crate::metrics::{DefragReport, MetricsCollector, parse_defrag_info};
 use redis::aio::ConnectionManager;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -128,23 +128,28 @@ impl Wyrm {
     }
 
     #[tool(description = "Fetch Defrag Task Invocation Snapshot")]
-    async fn fetch_defrag_snapshot(&self) -> CallResult<DefragSnapshot> {
-        let metrics = self.metrics_collector.as_ref();
-        let snapshot = if let Some(m) = metrics {
-            let response = m
-                .fetch()
-                .await
-                .map_err(|err| format!("Failed to fetch metrics: {err}"))?;
-            parse_defrag_snapshot(&response)
+    async fn fetch_defrag_snapshot(&self) -> CallResult<DefragReport> {
+        let mut report = DefragReport::default();
+        if let Some(m) = self.metrics_collector.as_ref() {
+            match m.collect_defrag().await {
+                Ok(snapshot) => report.accept_http(snapshot),
+                Err(err) => report.add_limitation(format!("HTTP metrics not available: {err:#}")),
+            }
         } else {
+            report.add_limitation("HTTP metrics URL is not set up".to_owned());
+        }
+
+        if !report.has_counters() {
             let raw = self
                 .run_command("INFO STATS")
                 .await
                 .map_err(|err| format!("Failed to fetch INFO STATS: {err}"))?;
-            parse_defrag_info(&raw)
-        };
-        let snapshot = snapshot.map_err(|err| format!("Failed to parse metrics: {err}"))?;
-        Ok(Json(snapshot))
+            let snapshot =
+                parse_defrag_info(&raw).map_err(|err| format!("Failed to parse metrics: {err}"))?;
+            report.accept_resp(snapshot);
+        }
+
+        Ok(Json(report))
     }
 }
 

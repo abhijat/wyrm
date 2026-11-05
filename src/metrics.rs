@@ -30,6 +30,11 @@ impl MetricsCollector {
             .await?;
         Ok(response)
     }
+
+    pub(crate) async fn collect_defrag(&self) -> anyhow::Result<DefragSnapshot> {
+        let txt = self.fetch().await?;
+        parse_defrag_snapshot(&txt)
+    }
 }
 
 #[derive(Default, serde::Serialize, schemars::JsonSchema)]
@@ -40,6 +45,55 @@ pub(crate) struct DefragSnapshot {
     skipped_mem_under_threshold: Option<u64>,
     skipped_within_check_interval: Option<u64>,
     skipped_not_enough_fragmentation: Option<u64>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) enum MetricSource {
+    Http,
+    Resp,
+}
+
+#[derive(Default, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct DefragSources {
+    invocations: Option<MetricSource>,
+    attempts: Option<MetricSource>,
+    objects_moved: Option<MetricSource>,
+}
+
+#[derive(Default, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct DefragReport {
+    snapshot: DefragSnapshot,
+    sources: DefragSources,
+    limitations: Vec<String>,
+}
+
+impl DefragReport {
+    pub(crate) fn accept_http(&mut self, snapshot: DefragSnapshot) {
+        self.sources.invocations = snapshot.invocations.map(|_| MetricSource::Http);
+        self.sources.attempts = snapshot.attempts.map(|_| MetricSource::Http);
+        self.sources.objects_moved = snapshot.objects_moved.map(|_| MetricSource::Http);
+        self.snapshot = snapshot;
+    }
+
+    pub(crate) fn accept_resp(&mut self, snapshot: DefragSnapshot) {
+        self.sources.invocations = snapshot.invocations.map(|_| MetricSource::Resp);
+        self.sources.attempts = snapshot.attempts.map(|_| MetricSource::Resp);
+        self.sources.objects_moved = snapshot.objects_moved.map(|_| MetricSource::Resp);
+
+        self.snapshot.invocations = snapshot.invocations;
+        self.snapshot.attempts = snapshot.attempts;
+        self.snapshot.objects_moved = snapshot.objects_moved;
+    }
+
+    pub(crate) fn add_limitation(&mut self, limitation: String) {
+        self.limitations.push(limitation);
+    }
+
+    pub(crate) fn has_counters(&self) -> bool {
+        self.snapshot.invocations.is_some()
+            && self.snapshot.attempts.is_some()
+            && self.snapshot.objects_moved.is_some()
+    }
 }
 
 fn parse_value_as_unsigned(value: Value) -> Option<u64> {
