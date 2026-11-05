@@ -150,3 +150,56 @@ fn parse_thread_id(row: &str) -> anyhow::Result<u64> {
     let thread_id = thread_id.parse()?;
     Ok(thread_id)
 }
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct SizeClassWaste {
+    block_size_bytes: u64,
+    committed_bytes: u64,
+    used_bytes: u64,
+    wasted_bytes: u64,
+    waste_percent: Option<f64>,
+}
+
+fn rank_waste(summary: &ArenaSummary) -> Vec<SizeClassWaste> {
+    let mut size_class_waste: Vec<_> = summary
+        .size_classes
+        .iter()
+        .filter(|(_, alloc_stats)| alloc_stats.wasted_bytes > 0)
+        .map(|(block_size, alloc_stats)| {
+            let waste_percent = if alloc_stats.committed_bytes == 0 {
+                None
+            } else {
+                Some(100.0 * alloc_stats.wasted_bytes as f64 / alloc_stats.committed_bytes as f64)
+            };
+            SizeClassWaste {
+                block_size_bytes: *block_size,
+                committed_bytes: alloc_stats.committed_bytes,
+                used_bytes: alloc_stats.used_bytes,
+                wasted_bytes: alloc_stats.wasted_bytes,
+                waste_percent,
+            }
+        })
+        .collect();
+    size_class_waste.sort_unstable_by(|a, b| {
+        b.wasted_bytes
+            .cmp(&a.wasted_bytes)
+            .then_with(|| a.block_size_bytes.cmp(&b.block_size_bytes))
+    });
+    size_class_waste
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ArenaReport {
+    snapshot: ArenaSnapshot,
+    ranked_waste: Vec<SizeClassWaste>,
+}
+
+impl ArenaReport {
+    pub(crate) fn new(snapshot: ArenaSnapshot) -> Self {
+        let ranked_waste = rank_waste(&snapshot.aggregate);
+        Self {
+            snapshot,
+            ranked_waste,
+        }
+    }
+}

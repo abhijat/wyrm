@@ -1,4 +1,4 @@
-use crate::arena::{ArenaParams, ArenaSnapshot, HeapKind, parse_arena_summary};
+use crate::arena::{ArenaParams, ArenaReport, HeapKind, parse_arena_summary};
 use crate::connection::{ConnectionMemorySample, ConnectionProfile};
 use crate::memory::MemorySnapshot;
 use redis::aio::ConnectionManager;
@@ -95,7 +95,7 @@ impl Wyrm {
     async fn fetch_arena_snapshot(
         &self,
         Parameters(ArenaParams { heap }): Parameters<ArenaParams>,
-    ) -> CallResult<ArenaSnapshot> {
+    ) -> CallResult<ArenaReport> {
         let mut command = redis::cmd("MEMORY");
         command.arg("ARENA").arg("SUMMARY");
         if matches!(&heap, HeapKind::Backing) {
@@ -108,7 +108,8 @@ impl Wyrm {
             .map_err(|err| format!("Failed to fetch ARENA: {err}"))?;
         let snapshot = parse_arena_summary(&raw, heap)
             .map_err(|err| format!("Count not parse ARENA: {err}"))?;
-        Ok(Json(snapshot))
+        let report = ArenaReport::new(snapshot);
+        Ok(Json(report))
     }
 }
 
