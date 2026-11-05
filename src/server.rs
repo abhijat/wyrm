@@ -1,6 +1,7 @@
 use crate::arena::{ArenaParams, ArenaReport, HeapKind, parse_arena_summary};
 use crate::connection::{ConnectionMemorySample, ConnectionProfile};
 use crate::memory::MemorySnapshot;
+use crate::metrics::{DefragSnapshot, MetricsCollector, parse_defrag_snapshot};
 use redis::aio::ConnectionManager;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -12,14 +13,19 @@ use tokio::time::{Instant, sleep};
 pub(crate) struct Wyrm {
     tool_router: ToolRouter<Self>,
     connection: ConnectionManager,
+    metrics_collector: Option<MetricsCollector>,
 }
 
 #[tool_router]
 impl Wyrm {
-    pub(crate) fn new(connection: ConnectionManager) -> Self {
+    pub(crate) fn new(
+        connection: ConnectionManager,
+        metrics_collector: Option<MetricsCollector>,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             connection,
+            metrics_collector,
         }
     }
 
@@ -110,6 +116,21 @@ impl Wyrm {
             .map_err(|err| format!("Count not parse ARENA: {err}"))?;
         let report = ArenaReport::new(snapshot);
         Ok(Json(report))
+    }
+
+    #[tool(description = "Fetch Defrag Task Invocation Snapshot")]
+    async fn fetch_defrag_snapshot(&self) -> CallResult<DefragSnapshot> {
+        let metrics = self
+            .metrics_collector
+            .as_ref()
+            .ok_or_else(|| "A WYRM_METRICS_URL is not configured".to_string())?;
+        let response = metrics
+            .fetch()
+            .await
+            .map_err(|err| format!("Failed to fetch metrics: {err}"))?;
+        let snapshot = parse_defrag_snapshot(&response)
+            .map_err(|err| format!("Failed to parse metrics: {err}"))?;
+        Ok(Json(snapshot))
     }
 }
 
