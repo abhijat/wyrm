@@ -1,3 +1,4 @@
+use crate::parsing::{info_iterator, parse_u64};
 use anyhow::ensure;
 use prometheus_parse::{Sample, Scrape, Value};
 use rmcp::schemars;
@@ -49,6 +50,7 @@ fn parse_value_as_unsigned(value: Value) -> Option<u64> {
             || c < 0.0
             || c.fract() != 0.0
             || !c.is_finite()
+            || c >= 18_446_744_073_709_551_616.0
         {
             return None;
         }
@@ -100,5 +102,24 @@ pub(crate) fn parse_defrag_snapshot(input: &str) -> anyhow::Result<DefragSnapsho
         snapshot.set_field(sample);
     }
     ensure!(snapshot.is_populated(), "Snapshot is empty");
+    Ok(snapshot)
+}
+
+pub(crate) fn parse_defrag_info(input: &str) -> anyhow::Result<DefragSnapshot> {
+    let mut snapshot = DefragSnapshot::default();
+    for (k, v) in info_iterator(input) {
+        match k.trim() {
+            "defrag_task_invocation_total" => {
+                snapshot.invocations = Some(parse_u64(v, "invocations")?)
+            }
+            "defrag_attempt_total" => snapshot.attempts = Some(parse_u64(v, "attempts")?),
+            "defrag_realloc_total" => snapshot.objects_moved = Some(parse_u64(v, "objects_moved")?),
+            _ => {}
+        }
+    }
+    ensure!(
+        snapshot.is_populated(),
+        "No usable defrag counters found in INFO STATS"
+    );
     Ok(snapshot)
 }

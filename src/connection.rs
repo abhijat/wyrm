@@ -1,3 +1,4 @@
+use crate::parsing::info_iterator;
 use rmcp::schemars;
 
 #[derive(Debug, Default, serde::Serialize, schemars::JsonSchema)]
@@ -71,27 +72,17 @@ pub(crate) fn connection_memory_findings(change: &ConnectionMemoryChange) -> Opt
 pub(crate) fn parse_client_info(input: &str) -> anyhow::Result<ConnectionSnapshot> {
     let mut snapshot = ConnectionSnapshot::default();
 
-    for row in input.lines() {
-        if row.is_empty() {
-            continue;
-        }
-
-        if row.starts_with('#') {
-            continue;
-        }
-
-        if let Some((k, v)) = row.split_once(':') {
-            match k.trim() {
-                "connected_clients" => {
-                    snapshot.connected_clients =
-                        Some(crate::parsing::parse_u64(v, "connected_clients")?)
-                }
-                "client_read_buffer_bytes" => {
-                    snapshot.client_read_buffer_bytes =
-                        Some(crate::parsing::parse_u64(v, "client_read_buffer_bytes")?)
-                }
-                _ => {}
+    for (k, v) in info_iterator(input) {
+        match k.trim() {
+            "connected_clients" => {
+                snapshot.connected_clients =
+                    Some(crate::parsing::parse_u64(v, "connected_clients")?)
             }
+            "client_read_buffer_bytes" => {
+                snapshot.client_read_buffer_bytes =
+                    Some(crate::parsing::parse_u64(v, "client_read_buffer_bytes")?)
+            }
+            _ => {}
         }
     }
 

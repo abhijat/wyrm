@@ -1,7 +1,10 @@
 use crate::arena::{ArenaParams, ArenaReport, HeapKind, parse_arena_summary};
-use crate::connection::{ConnectionMemorySample, ConnectionProfile};
-use crate::memory::MemorySnapshot;
-use crate::metrics::{DefragSnapshot, MetricsCollector, parse_defrag_snapshot};
+use crate::connection::{
+    ConnectionMemorySample, ConnectionProfile, connection_memory_change,
+    connection_memory_findings, parse_client_info,
+};
+use crate::memory::{MemorySnapshot, parse_memory_info};
+use crate::metrics::{DefragSnapshot, MetricsCollector, parse_defrag_info, parse_defrag_snapshot};
 use redis::aio::ConnectionManager;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -29,15 +32,24 @@ impl Wyrm {
         }
     }
 
+    async fn run_command(&self, cmd: &str) -> anyhow::Result<String> {
+        let cmd: Vec<_> = cmd.split_whitespace().collect();
+        let mut command = redis::cmd(cmd[0]);
+        for arg in cmd.iter().skip(1) {
+            command.arg(arg);
+        }
+        let mut conn = self.connection.clone();
+        let raw: String = command.query_async(&mut conn).await?;
+        Ok(raw)
+    }
+
     #[tool(description = "Fetch INFO MEMORY snapshot")]
     async fn fetch_info_memory_snapshot(&self) -> CallResult<MemorySnapshot> {
-        let mut conn = self.connection.clone();
-        let raw: String = redis::cmd("INFO")
-            .arg("MEMORY")
-            .query_async(&mut conn)
+        let raw = self
+            .run_command("INFO MEMORY")
             .await
             .map_err(|err| format!("Failed to fetch INFO MEMORY: {err}"))?;
-        let snapshot = crate::memory::parse_memory_info(&raw)
+        let snapshot = parse_memory_info(&raw)
             .map_err(|err| format!("Failed to parse INFO MEMORY: {err:#}"))?;
         Ok(Json(snapshot))
     }
@@ -49,13 +61,11 @@ impl Wyrm {
     }
 
     async fn fetch_and_parse_conn_snapshot(&self) -> Result<ConnectionProfile, String> {
-        let mut conn = self.connection.clone();
-        let raw: String = redis::cmd("INFO")
-            .arg("CLIENTS")
-            .query_async(&mut conn)
+        let raw = self
+            .run_command("INFO CLIENTS")
             .await
             .map_err(|err| format!("Failed to fetch INFO CLIENTS: {err:#}"))?;
-        let snapshot = crate::connection::parse_client_info(&raw)
+        let snapshot = parse_client_info(&raw)
             .map_err(|err| format!("Failed to parse INFO CLIENTS: {err:#}"))?;
 
         let average_read_buffer_bytes_per_connection =
@@ -85,8 +95,8 @@ impl Wyrm {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let after = self.fetch_and_parse_conn_snapshot().await?;
 
-        let change = crate::connection::connection_memory_change(&before.snapshot, &after.snapshot);
-        let findings = crate::connection::connection_memory_findings(&change);
+        let change = connection_memory_change(&before.snapshot, &after.snapshot);
+        let findings = connection_memory_findings(&change);
         let sample = ConnectionMemorySample {
             before,
             after,
@@ -102,14 +112,13 @@ impl Wyrm {
         &self,
         Parameters(ArenaParams { heap }): Parameters<ArenaParams>,
     ) -> CallResult<ArenaReport> {
-        let mut command = redis::cmd("MEMORY");
-        command.arg("ARENA").arg("SUMMARY");
-        if matches!(&heap, HeapKind::Backing) {
-            command.arg("BACKING");
-        }
-        let mut conn = self.connection.clone();
-        let raw: String = command
-            .query_async(&mut conn)
+        let command = if matches!(&heap, HeapKind::Backing) {
+            "MEMORY ARENA SUMMARY BACKING"
+        } else {
+            "MEMORY ARENA SUMMARY"
+        };
+        let raw = self
+            .run_command(command)
             .await
             .map_err(|err| format!("Failed to fetch ARENA: {err}"))?;
         let snapshot = parse_arena_summary(&raw, heap)
@@ -120,16 +129,21 @@ impl Wyrm {
 
     #[tool(description = "Fetch Defrag Task Invocation Snapshot")]
     async fn fetch_defrag_snapshot(&self) -> CallResult<DefragSnapshot> {
-        let metrics = self
-            .metrics_collector
-            .as_ref()
-            .ok_or_else(|| "A WYRM_METRICS_URL is not configured".to_string())?;
-        let response = metrics
-            .fetch()
-            .await
-            .map_err(|err| format!("Failed to fetch metrics: {err}"))?;
-        let snapshot = parse_defrag_snapshot(&response)
-            .map_err(|err| format!("Failed to parse metrics: {err}"))?;
+        let metrics = self.metrics_collector.as_ref();
+        let snapshot = if let Some(m) = metrics {
+            let response = m
+                .fetch()
+                .await
+                .map_err(|err| format!("Failed to fetch metrics: {err}"))?;
+            parse_defrag_snapshot(&response)
+        } else {
+            let raw = self
+                .run_command("INFO STATS")
+                .await
+                .map_err(|err| format!("Failed to fetch INFO STATS: {err}"))?;
+            parse_defrag_info(&raw)
+        };
+        let snapshot = snapshot.map_err(|err| format!("Failed to parse metrics: {err}"))?;
         Ok(Json(snapshot))
     }
 }
