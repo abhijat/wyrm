@@ -1,8 +1,9 @@
 use crate::arena::{ArenaSnapshot, HeapKind, parse_arena_summary};
-use crate::connection::parse_client_info;
+use crate::connection::{ConnectionSnapshot, parse_client_info};
 use crate::memory::{MemorySnapshot, parse_memory_info};
 use crate::memory_gap::{
-    MemoryGapComparison, MemoryGapReport, MemoryGapToolResponse, SourceTiming,
+    MemoryGapComparison, MemoryGapObservation, MemoryGapReport, MemoryGapSampling,
+    MemoryGapToolResponse, SourceTiming,
 };
 use crate::metrics::MetricsCollector;
 use redis::aio::ConnectionManager;
@@ -10,7 +11,7 @@ use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{Json, ServerHandler, schemars, tool, tool_handler, tool_router};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant, sleep_until};
 
 pub(crate) struct Wyrm {
     tool_router: ToolRouter<Self>,
@@ -54,7 +55,7 @@ impl Wyrm {
     }
 
     #[tool(
-        description = "Explain the RSS versus database memory gap from one sequential snapshot, or compare two snapshots with interval_ms. A supplied interval must be 1000–10000 ms and is slept after the first collection, so actual elapsed time is longer. Requires configured HTTP metrics and scans both arena heaps, which may be costly on large heaps."
+        description = "Explain the RSS versus database memory gap from one sequential snapshot, or compare two full snapshots with intermediate INFO and HTTP samples using interval_ms. A supplied interval must be 1000–10000 ms. Requires configured HTTP metrics and scans both arena heaps at the endpoints, which may be costly on large heaps."
     )]
     async fn explain_memory_gap(
         &self,
@@ -69,7 +70,7 @@ impl Wyrm {
         }
 
         let before_start = Instant::now();
-        let before = self.collect_memory_gap().await?;
+        let before = self.collect_memory_gap(before_start, "before").await?;
         let Some(requested_interval_ms) = interval_ms else {
             return Ok(Json(MemoryGapToolResponse {
                 snapshot: before.report,
@@ -77,10 +78,32 @@ impl Wyrm {
             }));
         };
 
-        sleep(Duration::from_millis(requested_interval_ms)).await;
+        let mut observations = vec![before.observation];
+        let window_start = Instant::now();
+        let deadline = window_start + Duration::from_millis(requested_interval_ms);
+        let mut next_tick = window_start + Duration::from_secs(1);
+        while next_tick < deadline {
+            sleep_until(next_tick).await;
+            if Instant::now() >= deadline {
+                break;
+            }
+            let observation = self
+                .collect_cheap_snapshot(before_start, "intermediate")
+                .await
+                .observation;
+            observations.push(observation);
+            next_tick += Duration::from_secs(1);
+            let now = Instant::now();
+            while next_tick <= now {
+                next_tick += Duration::from_secs(1);
+            }
+        }
+        sleep_until(deadline).await;
         let after_start = Instant::now();
         let elapsed_ms = after_start.duration_since(before_start).as_secs_f64() * 1000.0;
-        let after = self.collect_memory_gap().await?;
+        let after = self.collect_memory_gap(before_start, "after").await?;
+        observations.push(after.observation);
+        let sampling = MemoryGapSampling::new(observations);
         let comparison = MemoryGapComparison::new(
             before.report,
             &after.report,
@@ -88,6 +111,7 @@ impl Wyrm {
             before.backing_arena.compare(&after.backing_arena),
             requested_interval_ms,
             elapsed_ms,
+            sampling,
         );
         Ok(Json(MemoryGapToolResponse {
             snapshot: after.report,
@@ -95,58 +119,33 @@ impl Wyrm {
         }))
     }
 
-    async fn collect_memory_gap(&self) -> Result<CollectedMemoryGap, String> {
-        let metrics = self.metrics_collector.as_ref().ok_or_else(|| {
-            "Failed to collect connection memory gauge: WYRM_METRICS_URL is not set up".to_owned()
-        })?;
-        let start = Instant::now();
+    async fn collect_memory_gap(
+        &self,
+        sampling_start: Instant,
+        label: &str,
+    ) -> Result<CollectedMemoryGap, String> {
+        let report_start = Instant::now();
         let collected_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|err| format!("Failed to timestamp collection: {err}"))?
             .as_millis();
-        let mut sources = Vec::new();
-
-        let source_start = Instant::now();
-        let raw = self
-            .run_command("INFO MEMORY")
-            .await
-            .map_err(|err| format!("Failed to fetch INFO MEMORY: {err:#}"))?;
-        sources.push(source_timing(
-            "INFO MEMORY",
-            start,
-            source_start,
-            Instant::now(),
-        ));
-        let memory = parse_memory_info(&raw)
-            .map_err(|err| format!("Failed to parse INFO MEMORY: {err:#}"))?;
-
-        let source_start = Instant::now();
-        let raw = self
-            .run_command("INFO CLIENTS")
-            .await
-            .map_err(|err| format!("Failed to fetch INFO CLIENTS: {err:#}"))?;
-        sources.push(source_timing(
-            "INFO CLIENTS",
-            start,
-            source_start,
-            Instant::now(),
-        ));
-        let clients = parse_client_info(&raw)
-            .map_err(|err| format!("Failed to parse INFO CLIENTS: {err:#}"))?;
-
-        let source_start = Instant::now();
-        let direct_connection_estimate_bytes = metrics
-            .collect_connection_memory_bytes()
-            .await
-            .map_err(|err| {
-                format!("Failed to collect dragonfly_connection_memory_bytes: {err:#}")
-            })?;
-        sources.push(source_timing(
-            "HTTP dragonfly_connection_memory_bytes",
-            start,
-            source_start,
-            Instant::now(),
-        ));
+        let cheap = self.collect_cheap_snapshot(sampling_start, label).await;
+        if let Some(error) = cheap.observation.error.as_ref() {
+            return Err(format!(
+                "Failed to collect {label} memory snapshot: {error}"
+            ));
+        }
+        let offset_ms = report_start.duration_since(sampling_start).as_secs_f64() * 1000.0;
+        let mut sources: Vec<_> = cheap
+            .observation
+            .sources
+            .iter()
+            .map(|source| SourceTiming {
+                source: source.source.clone(),
+                started_ms: source.started_ms - offset_ms,
+                finished_ms: source.finished_ms - offset_ms,
+            })
+            .collect();
 
         let source_start = Instant::now();
         let raw = self
@@ -155,7 +154,7 @@ impl Wyrm {
             .map_err(|err| format!("Failed to fetch MEMORY ARENA SUMMARY: {err:#}"))?;
         sources.push(source_timing(
             "MEMORY ARENA SUMMARY",
-            start,
+            report_start,
             source_start,
             Instant::now(),
         ));
@@ -169,7 +168,7 @@ impl Wyrm {
             .map_err(|err| format!("Failed to fetch MEMORY ARENA SUMMARY BACKING: {err:#}"))?;
         sources.push(source_timing(
             "MEMORY ARENA SUMMARY BACKING",
-            start,
+            report_start,
             source_start,
             Instant::now(),
         ));
@@ -177,9 +176,9 @@ impl Wyrm {
             .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY BACKING: {err:#}"))?;
 
         let report = MemoryGapReport::new(
-            memory,
-            clients,
-            direct_connection_estimate_bytes,
+            cheap.memory,
+            cheap.clients,
+            cheap.direct_connection_estimate_bytes,
             data_arena.compact_report(),
             backing_arena.compact_report(),
             sources,
@@ -189,7 +188,116 @@ impl Wyrm {
             report,
             data_arena,
             backing_arena,
+            observation: cheap.observation,
         })
+    }
+
+    async fn collect_cheap_snapshot(&self, sampling_start: Instant, label: &str) -> CheapSnapshot {
+        let started = Instant::now();
+        let mut memory = MemorySnapshot::default();
+        let mut clients = ConnectionSnapshot::default();
+        let mut direct_connection_estimate_bytes = None;
+        let mut sources = Vec::new();
+        let mut error = None;
+
+        let source_start = Instant::now();
+        match self.run_command("INFO MEMORY").await {
+            Ok(raw) => {
+                sources.push(source_timing(
+                    "INFO MEMORY",
+                    sampling_start,
+                    source_start,
+                    Instant::now(),
+                ));
+                match parse_memory_info(&raw) {
+                    Ok(snapshot) => memory = snapshot,
+                    Err(err) => error = Some(format!("Failed to parse INFO MEMORY: {err:#}")),
+                }
+            }
+            Err(err) => {
+                sources.push(source_timing(
+                    "INFO MEMORY",
+                    sampling_start,
+                    source_start,
+                    Instant::now(),
+                ));
+                error = Some(format!("Failed to fetch INFO MEMORY: {err:#}"));
+            }
+        }
+
+        if error.is_none() {
+            let source_start = Instant::now();
+            match self.run_command("INFO CLIENTS").await {
+                Ok(raw) => {
+                    sources.push(source_timing(
+                        "INFO CLIENTS",
+                        sampling_start,
+                        source_start,
+                        Instant::now(),
+                    ));
+                    match parse_client_info(&raw) {
+                        Ok(snapshot) => clients = snapshot,
+                        Err(err) => error = Some(format!("Failed to parse INFO CLIENTS: {err:#}")),
+                    }
+                }
+                Err(err) => {
+                    sources.push(source_timing(
+                        "INFO CLIENTS",
+                        sampling_start,
+                        source_start,
+                        Instant::now(),
+                    ));
+                    error = Some(format!("Failed to fetch INFO CLIENTS: {err:#}"));
+                }
+            }
+        }
+
+        if error.is_none() {
+            if let Some(metrics) = self.metrics_collector.as_ref() {
+                let source_start = Instant::now();
+                match metrics.collect_connection_memory_bytes().await {
+                    Ok(value) => direct_connection_estimate_bytes = value,
+                    Err(err) => {
+                        error = Some(format!(
+                            "Failed to collect dragonfly_connection_memory_bytes: {err:#}"
+                        ));
+                    }
+                }
+                sources.push(source_timing(
+                    "HTTP dragonfly_connection_memory_bytes",
+                    sampling_start,
+                    source_start,
+                    Instant::now(),
+                ));
+            } else {
+                error =
+                    Some("WYRM_METRICS_URL is not set up for connection memory gauge".to_owned());
+            }
+        }
+
+        let rss_bytes = memory.used_memory_rss;
+        let db_used_bytes = memory.used_memory;
+        let observation = MemoryGapObservation {
+            label: label.to_owned(),
+            started_ms: started.duration_since(sampling_start).as_secs_f64() * 1000.0,
+            finished_ms: Instant::now().duration_since(sampling_start).as_secs_f64() * 1000.0,
+            sources,
+            rss_bytes,
+            db_used_bytes,
+            rss_minus_db_used_bytes: rss_bytes
+                .zip(db_used_bytes)
+                .map(|(rss, db)| i128::from(rss) - i128::from(db)),
+            connected_clients: clients.connected_clients,
+            direct_connection_estimate_bytes,
+            client_read_buffer_capacity_bytes: clients.client_read_buffer_bytes,
+            error,
+        };
+        CheapSnapshot {
+            memory,
+            clients,
+            direct_connection_estimate_bytes,
+            observation,
+        }
     }
 }
 
@@ -197,6 +305,14 @@ struct CollectedMemoryGap {
     report: MemoryGapReport,
     data_arena: ArenaSnapshot,
     backing_arena: ArenaSnapshot,
+    observation: MemoryGapObservation,
+}
+
+struct CheapSnapshot {
+    memory: MemorySnapshot,
+    clients: ConnectionSnapshot,
+    direct_connection_estimate_bytes: Option<u64>,
+    observation: MemoryGapObservation,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]

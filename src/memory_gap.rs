@@ -6,7 +6,8 @@ use rmcp::schemars;
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct SourceTiming {
     pub(crate) source: String,
-    // Offsets from the start of this report's collection, not Unix timestamps.
+    // Report offsets use that report's start. Observation offsets use the overall
+    // call's collection start, before the first arena scans and observation window.
     pub(crate) started_ms: f64,
     pub(crate) finished_ms: f64,
 }
@@ -49,6 +50,7 @@ pub(crate) struct MemoryGapComparison {
     pub(crate) client_read_buffer_capacity_bytes_delta: Option<i128>,
     pub(crate) data_arena: ArenaComparison,
     pub(crate) backing_arena: ArenaComparison,
+    pub(crate) sampling: MemoryGapSampling,
     pub(crate) findings: Vec<String>,
     pub(crate) limitations: Vec<String>,
 }
@@ -61,6 +63,7 @@ impl MemoryGapComparison {
         backing_arena: ArenaComparison,
         requested_interval_ms: u64,
         elapsed_ms: f64,
+        sampling: MemoryGapSampling,
     ) -> Self {
         let signed_delta = |before: Option<u64>, after: Option<u64>| {
             before
@@ -130,8 +133,8 @@ impl MemoryGapComparison {
             }
         }
         let mut limitations = vec![
-            "the requested interval is the sleep after the first collection; actual start-to-start elapsed time is at least this long".to_owned(),
-            "two endpoints cannot show intervening spikes or allocation churn".to_owned(),
+            "intermediate sampling runs during the requested observation window; actual start-to-start elapsed time can be longer because collection takes time".to_owned(),
+            "finite intermediate samples cannot establish the continuous peak or rule out churn between observations".to_owned(),
             "each endpoint is sequential and not an atomic snapshot".to_owned(),
             "observed changes do not establish that connection changes caused RSS changes or that defragmentation caused allocator changes".to_owned(),
         ];
@@ -158,9 +161,188 @@ impl MemoryGapComparison {
             client_read_buffer_capacity_bytes_delta,
             data_arena,
             backing_arena,
+            sampling,
             findings,
             limitations,
         }
+    }
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct MemoryGapObservation {
+    pub(crate) label: String,
+    // These offsets and source offsets share the overall call's collection start.
+    // The finish time covers INFO and HTTP collection, not arena scans.
+    pub(crate) started_ms: f64,
+    pub(crate) finished_ms: f64,
+    pub(crate) sources: Vec<SourceTiming>,
+    pub(crate) rss_bytes: Option<u64>,
+    pub(crate) db_used_bytes: Option<u64>,
+    pub(crate) rss_minus_db_used_bytes: Option<i128>,
+    pub(crate) connected_clients: Option<u64>,
+    pub(crate) direct_connection_estimate_bytes: Option<u64>,
+    pub(crate) client_read_buffer_capacity_bytes: Option<u64>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ObservedRange {
+    pub(crate) min: Option<i128>,
+    pub(crate) max: Option<i128>,
+    pub(crate) valid_sample_count: usize,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct MemoryGapSampleRanges {
+    pub(crate) rss_bytes: ObservedRange,
+    pub(crate) db_used_bytes: ObservedRange,
+    pub(crate) rss_minus_db_used_bytes: ObservedRange,
+    pub(crate) connected_clients: ObservedRange,
+    pub(crate) direct_connection_estimate_bytes: ObservedRange,
+    pub(crate) client_read_buffer_capacity_bytes: ObservedRange,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct MemoryGapSampling {
+    pub(crate) sample_period_ms: u64,
+    pub(crate) observations: Vec<MemoryGapObservation>,
+    pub(crate) successful_sample_count: usize,
+    pub(crate) failed_sample_count: usize,
+    pub(crate) ranges: MemoryGapSampleRanges,
+    pub(crate) findings: Vec<String>,
+    pub(crate) limitations: Vec<String>,
+}
+
+impl MemoryGapSampling {
+    pub(crate) fn new(observations: Vec<MemoryGapObservation>) -> Self {
+        let range = |get: fn(&MemoryGapObservation) -> Option<i128>| {
+            let values: Vec<_> = observations.iter().filter_map(get).collect();
+            ObservedRange {
+                min: values.iter().min().copied(),
+                max: values.iter().max().copied(),
+                valid_sample_count: values.len(),
+            }
+        };
+        let ranges = MemoryGapSampleRanges {
+            rss_bytes: range(|sample| sample.rss_bytes.map(i128::from)),
+            db_used_bytes: range(|sample| sample.db_used_bytes.map(i128::from)),
+            rss_minus_db_used_bytes: range(|sample| sample.rss_minus_db_used_bytes),
+            connected_clients: range(|sample| sample.connected_clients.map(i128::from)),
+            direct_connection_estimate_bytes: range(|sample| {
+                sample.direct_connection_estimate_bytes.map(i128::from)
+            }),
+            client_read_buffer_capacity_bytes: range(|sample| {
+                sample.client_read_buffer_capacity_bytes.map(i128::from)
+            }),
+        };
+        let successful_sample_count = observations
+            .iter()
+            .filter(|sample| sample.error.is_none())
+            .count();
+        let failed_sample_count = observations.len() - successful_sample_count;
+        let mut findings = Vec::new();
+        add_excursion_findings(&mut findings, &observations, "RSS", "bytes", |sample| {
+            sample.rss_bytes.map(i128::from)
+        });
+        add_excursion_findings(
+            &mut findings,
+            &observations,
+            "DB used memory",
+            "bytes",
+            |sample| sample.db_used_bytes.map(i128::from),
+        );
+        add_excursion_findings(
+            &mut findings,
+            &observations,
+            "RSS minus DB used memory",
+            "bytes",
+            |sample| sample.rss_minus_db_used_bytes,
+        );
+        add_excursion_findings(
+            &mut findings,
+            &observations,
+            "connected clients",
+            "clients",
+            |sample| sample.connected_clients.map(i128::from),
+        );
+        add_excursion_findings(
+            &mut findings,
+            &observations,
+            "direct connection estimate",
+            "bytes",
+            |sample| sample.direct_connection_estimate_bytes.map(i128::from),
+        );
+        add_excursion_findings(
+            &mut findings,
+            &observations,
+            "client read-buffer capacity",
+            "bytes",
+            |sample| sample.client_read_buffer_capacity_bytes.map(i128::from),
+        );
+        if failed_sample_count > 0 {
+            findings.push(format!(
+                "{failed_sample_count} intermediate sample(s) failed; any partial values remain included in ranges"
+            ));
+        }
+        let limitations = vec![
+            "observation and source offsets are measured from the start of the first full collection; the requested observation window starts after that collection finishes".to_owned(),
+            "one-second sampling slots missed during slow collection are skipped; actual timing is recorded for each attempted observation".to_owned(),
+            "intermediate samples are finite observations and cannot establish the continuous peak or rule out churn between samples".to_owned(),
+            "unchanged values apply only to the available samples and do not establish continuous stability".to_owned(),
+            "intermediate sampling uses INFO and HTTP sources; allocator arenas are sampled only at the full endpoints".to_owned(),
+        ];
+        Self {
+            sample_period_ms: 1000,
+            observations,
+            successful_sample_count,
+            failed_sample_count,
+            ranges,
+            findings,
+            limitations,
+        }
+    }
+}
+
+fn add_excursion_findings(
+    findings: &mut Vec<String>,
+    samples: &[MemoryGapObservation],
+    name: &str,
+    unit: &str,
+    get: fn(&MemoryGapObservation) -> Option<i128>,
+) {
+    let intermediate: Vec<_> = samples
+        .iter()
+        .skip(1)
+        .take(samples.len().saturating_sub(2))
+        .filter_map(get)
+        .collect();
+    if let (Some(first), Some(last)) = (samples.first().and_then(get), samples.last().and_then(get))
+    {
+        let endpoints_min = first.min(last);
+        let endpoints_max = first.max(last);
+        if let Some(maximum) = intermediate.iter().max()
+            && *maximum > endpoints_max
+        {
+            findings.push(format!(
+                "intermediate {name} reached {maximum} {unit}, {excess} {unit} above the higher endpoint value {endpoints_max} {unit}",
+                excess = *maximum - endpoints_max
+            ));
+        }
+        if let Some(minimum) = intermediate.iter().min()
+            && *minimum < endpoints_min
+        {
+            findings.push(format!(
+                "intermediate {name} reached {minimum} {unit}, {shortfall} {unit} below the lower endpoint value {endpoints_min} {unit}",
+                shortfall = endpoints_min - *minimum
+            ));
+        }
+    }
+    let valid_values: Vec<_> = samples.iter().filter_map(get).collect();
+    if valid_values.len() >= 2 && valid_values.iter().all(|value| *value == valid_values[0]) {
+        findings.push(format!(
+            "{name} was unchanged at {} {unit} across {} valid readings out of {} attempted observations",
+            valid_values[0], valid_values.len(), samples.len()
+        ));
     }
 }
 
