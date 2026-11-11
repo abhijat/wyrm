@@ -4,7 +4,7 @@ Dragonfly MCP server
 
 ## Requirements
 
-- pip
+- pip or npm for installing
 - Linux x86-64 and glibc 2.28+
 
 ## Installation
@@ -17,4 +17,10 @@ and to update
 
 `pip install --upgrade dragonfly-wyrm`
 
-The `wyrm` executable can be run after this.
+### NPM
+
+`npm install -g dragonfly-wyrm`
+
+## Run
+
+After any of the above, the `wyrm` executable can be run.

@@ -1,0 +1,16 @@
+{
+  "name": "dragonfly-wyrm",
+  "version": "0.1.0",
+  "description": "A Dragonfly diagnostic MCP server",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abhijat/wyrm.git"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "bin": {
+    "wyrm": "bin/wyrm"
+  },
+  "files": ["bin/wyrm", "LICENSE", "README.md"]
+}
