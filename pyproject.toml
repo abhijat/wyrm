@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dragonfly-wyrm"
+dynamic = ["version"]
+description = "A Dragonfly diagnostic MCP server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.urls]
+Repository = "https://github.com/abhijat/wyrm"
+
+[tool.maturin]
+bindings = "bin"
