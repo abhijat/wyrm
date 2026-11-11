@@ -3,8 +3,8 @@ use rmcp::schemars;
 
 #[derive(Default, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct MemorySnapshot {
-    used_memory: Option<u64>,
-    used_memory_rss: Option<u64>,
+    pub(crate) used_memory: Option<u64>,
+    pub(crate) used_memory_rss: Option<u64>,
     maxmemory: Option<u64>,
 }
 

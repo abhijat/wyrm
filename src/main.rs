@@ -8,6 +8,7 @@ use std::env;
 mod arena;
 mod connection;
 mod memory;
+mod memory_gap;
 mod metrics;
 mod parsing;
 mod server;

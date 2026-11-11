@@ -2,16 +2,11 @@ use anyhow::{anyhow, bail, ensure};
 use rmcp::schemars;
 use std::collections::BTreeMap;
 
-#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HeapKind {
     Data,
     Backing,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-pub(crate) struct ArenaParams {
-    pub(crate) heap: HeapKind,
 }
 
 enum ArenaSection {
@@ -20,11 +15,11 @@ enum ArenaSection {
 }
 
 #[derive(Default, serde::Serialize, schemars::JsonSchema)]
-struct AllocStats {
-    reserved_bytes: u64,
-    committed_bytes: u64,
-    used_bytes: u64,
-    wasted_bytes: u64,
+pub(crate) struct AllocStats {
+    pub(crate) reserved_bytes: u64,
+    pub(crate) committed_bytes: u64,
+    pub(crate) used_bytes: u64,
+    pub(crate) wasted_bytes: u64,
 }
 
 impl AllocStats {
@@ -52,7 +47,6 @@ struct ArenaSummary {
     total: AllocStats,
 }
 
-#[derive(serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct ArenaSnapshot {
     heap: HeapKind,
     threads: BTreeMap<u64, ArenaSummary>,
@@ -152,12 +146,37 @@ fn parse_thread_id(row: &str) -> anyhow::Result<u64> {
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
-struct SizeClassWaste {
-    block_size_bytes: u64,
-    committed_bytes: u64,
-    used_bytes: u64,
-    wasted_bytes: u64,
-    waste_percent: Option<f64>,
+pub(crate) struct SizeClassWaste {
+    pub(crate) block_size_bytes: u64,
+    pub(crate) committed_bytes: u64,
+    pub(crate) used_bytes: u64,
+    pub(crate) wasted_bytes: u64,
+    pub(crate) waste_percent: Option<f64>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct CompactArenaReport {
+    pub(crate) heap: HeapKind,
+    pub(crate) total: AllocStats,
+    pub(crate) top_waste_classes: Vec<SizeClassWaste>,
+    pub(crate) waste_class_count: usize,
+    pub(crate) top_waste_classes_truncated: bool,
+}
+
+impl ArenaSnapshot {
+    pub(crate) fn compact_report(self) -> CompactArenaReport {
+        let ranked_waste = rank_waste(&self.aggregate);
+        let waste_class_count = ranked_waste.len();
+        let mut top_waste_classes = ranked_waste;
+        top_waste_classes.truncate(5);
+        CompactArenaReport {
+            heap: self.heap,
+            total: self.aggregate.total,
+            top_waste_classes_truncated: waste_class_count > top_waste_classes.len(),
+            top_waste_classes,
+            waste_class_count,
+        }
+    }
 }
 
 fn rank_waste(summary: &ArenaSummary) -> Vec<SizeClassWaste> {
@@ -186,20 +205,4 @@ fn rank_waste(summary: &ArenaSummary) -> Vec<SizeClassWaste> {
             .then_with(|| a.block_size_bytes.cmp(&b.block_size_bytes))
     });
     size_class_waste
-}
-
-#[derive(serde::Serialize, schemars::JsonSchema)]
-pub(crate) struct ArenaReport {
-    snapshot: ArenaSnapshot,
-    ranked_waste: Vec<SizeClassWaste>,
-}
-
-impl ArenaReport {
-    pub(crate) fn new(snapshot: ArenaSnapshot) -> Self {
-        let ranked_waste = rank_waste(&snapshot.aggregate);
-        Self {
-            snapshot,
-            ranked_waste,
-        }
-    }
 }

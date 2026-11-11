@@ -1,17 +1,13 @@
-use crate::arena::{ArenaParams, ArenaReport, HeapKind, parse_arena_summary};
-use crate::connection::{
-    ConnectionMemorySample, ConnectionProfile, connection_memory_change,
-    connection_memory_findings, parse_client_info,
-};
+use crate::arena::{HeapKind, parse_arena_summary};
+use crate::connection::parse_client_info;
 use crate::memory::{MemorySnapshot, parse_memory_info};
-use crate::metrics::{DefragReport, MetricsCollector, parse_defrag_info};
+use crate::memory_gap::{MemoryGapReport, SourceTiming};
+use crate::metrics::MetricsCollector;
 use redis::aio::ConnectionManager;
 use rmcp::handler::server::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
-use rmcp::{Json, ServerHandler, schemars, tool, tool_handler, tool_router};
-use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
+use tokio::time::Instant;
 
 pub(crate) struct Wyrm {
     tool_router: ToolRouter<Self>,
@@ -54,102 +50,114 @@ impl Wyrm {
         Ok(Json(snapshot))
     }
 
-    #[tool(description = "Fetch INFO CLIENTS snapshot")]
-    async fn fetch_connection_snapshot(&self) -> CallResult<ConnectionProfile> {
-        let p = self.fetch_and_parse_conn_snapshot().await?;
-        Ok(Json(p))
-    }
+    #[tool(
+        description = "Explain the RSS versus database memory gap from one sequential snapshot. Requires configured HTTP metrics and scans both arena heaps, which may be costly on large heaps."
+    )]
+    async fn explain_memory_gap(&self) -> CallResult<MemoryGapReport> {
+        let metrics = self.metrics_collector.as_ref().ok_or_else(|| {
+            "Failed to collect connection memory gauge: WYRM_METRICS_URL is not set up".to_owned()
+        })?;
+        let start = Instant::now();
+        let collected_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|err| format!("Failed to timestamp collection: {err}"))?
+            .as_millis();
+        let mut sources = Vec::new();
 
-    async fn fetch_and_parse_conn_snapshot(&self) -> Result<ConnectionProfile, String> {
+        let source_start = Instant::now();
+        let raw = self
+            .run_command("INFO MEMORY")
+            .await
+            .map_err(|err| format!("Failed to fetch INFO MEMORY: {err:#}"))?;
+        sources.push(source_timing(
+            "INFO MEMORY",
+            start,
+            source_start,
+            Instant::now(),
+        ));
+        let memory = parse_memory_info(&raw)
+            .map_err(|err| format!("Failed to parse INFO MEMORY: {err:#}"))?;
+
+        let source_start = Instant::now();
         let raw = self
             .run_command("INFO CLIENTS")
             .await
             .map_err(|err| format!("Failed to fetch INFO CLIENTS: {err:#}"))?;
-        let snapshot = parse_client_info(&raw)
+        sources.push(source_timing(
+            "INFO CLIENTS",
+            start,
+            source_start,
+            Instant::now(),
+        ));
+        let clients = parse_client_info(&raw)
             .map_err(|err| format!("Failed to parse INFO CLIENTS: {err:#}"))?;
 
-        let average_read_buffer_bytes_per_connection =
-            crate::connection::average_read_buffer_bytes(&snapshot);
-        Ok(ConnectionProfile {
-            snapshot,
-            average_read_buffer_bytes_per_connection,
-        })
-    }
-
-    #[tool(description = "Sample connection memory")]
-    async fn sample_connection_memory(
-        &self,
-        Parameters(SamplingParams { interval_ms }): Parameters<SamplingParams>,
-    ) -> CallResult<ConnectionMemorySample> {
-        if interval_ms < 100 || interval_ms > 5000 {
-            return Err(format!(
-                "interval_ms must be between 100 and 5000, got {interval_ms}"
-            ));
-        }
-
-        let start = Instant::now();
-        let before = self.fetch_and_parse_conn_snapshot().await?;
-
-        sleep(Duration::from_millis(interval_ms)).await;
-
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let after = self.fetch_and_parse_conn_snapshot().await?;
-
-        let change = connection_memory_change(&before.snapshot, &after.snapshot);
-        let findings = connection_memory_findings(&change);
-        let sample = ConnectionMemorySample {
-            before,
-            after,
-            elapsed_ms,
-            change,
-            findings,
-        };
-        Ok(Json(sample))
-    }
-
-    #[tool(description = "Fetch Arena")]
-    async fn fetch_arena_snapshot(
-        &self,
-        Parameters(ArenaParams { heap }): Parameters<ArenaParams>,
-    ) -> CallResult<ArenaReport> {
-        let command = if matches!(&heap, HeapKind::Backing) {
-            "MEMORY ARENA SUMMARY BACKING"
-        } else {
-            "MEMORY ARENA SUMMARY"
-        };
-        let raw = self
-            .run_command(command)
+        let source_start = Instant::now();
+        let direct_connection_estimate_bytes = metrics
+            .collect_connection_memory_bytes()
             .await
-            .map_err(|err| format!("Failed to fetch ARENA: {err}"))?;
-        let snapshot = parse_arena_summary(&raw, heap)
-            .map_err(|err| format!("Count not parse ARENA: {err}"))?;
-        let report = ArenaReport::new(snapshot);
-        Ok(Json(report))
+            .map_err(|err| {
+                format!("Failed to collect dragonfly_connection_memory_bytes: {err:#}")
+            })?;
+        sources.push(source_timing(
+            "HTTP dragonfly_connection_memory_bytes",
+            start,
+            source_start,
+            Instant::now(),
+        ));
+
+        let source_start = Instant::now();
+        let raw = self
+            .run_command("MEMORY ARENA SUMMARY")
+            .await
+            .map_err(|err| format!("Failed to fetch MEMORY ARENA SUMMARY: {err:#}"))?;
+        sources.push(source_timing(
+            "MEMORY ARENA SUMMARY",
+            start,
+            source_start,
+            Instant::now(),
+        ));
+        let data_arena = parse_arena_summary(&raw, HeapKind::Data)
+            .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY: {err:#}"))?
+            .compact_report();
+
+        let source_start = Instant::now();
+        let raw = self
+            .run_command("MEMORY ARENA SUMMARY BACKING")
+            .await
+            .map_err(|err| format!("Failed to fetch MEMORY ARENA SUMMARY BACKING: {err:#}"))?;
+        sources.push(source_timing(
+            "MEMORY ARENA SUMMARY BACKING",
+            start,
+            source_start,
+            Instant::now(),
+        ));
+        let backing_arena = parse_arena_summary(&raw, HeapKind::Backing)
+            .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY BACKING: {err:#}"))?
+            .compact_report();
+
+        Ok(Json(MemoryGapReport::new(
+            memory,
+            clients,
+            direct_connection_estimate_bytes,
+            data_arena,
+            backing_arena,
+            sources,
+            collected_at_unix_ms,
+        )))
     }
+}
 
-    #[tool(description = "Fetch Defrag Task Invocation Snapshot")]
-    async fn fetch_defrag_snapshot(&self) -> CallResult<DefragReport> {
-        let mut report = DefragReport::default();
-        if let Some(m) = self.metrics_collector.as_ref() {
-            match m.collect_defrag().await {
-                Ok(snapshot) => report.accept_http(snapshot),
-                Err(err) => report.add_limitation(format!("HTTP metrics not available: {err:#}")),
-            }
-        } else {
-            report.add_limitation("HTTP metrics URL is not set up".to_owned());
-        }
-
-        if !report.has_counters() {
-            let raw = self
-                .run_command("INFO STATS")
-                .await
-                .map_err(|err| format!("Failed to fetch INFO STATS: {err}"))?;
-            let snapshot =
-                parse_defrag_info(&raw).map_err(|err| format!("Failed to parse metrics: {err}"))?;
-            report.accept_resp(snapshot);
-        }
-
-        Ok(Json(report))
+fn source_timing(
+    source: &str,
+    start: Instant,
+    source_start: Instant,
+    source_end: Instant,
+) -> SourceTiming {
+    SourceTiming {
+        source: source.to_owned(),
+        started_ms: source_start.duration_since(start).as_secs_f64() * 1000.0,
+        finished_ms: source_end.duration_since(start).as_secs_f64() * 1000.0,
     }
 }
 
@@ -158,11 +166,6 @@ impl ServerHandler for Wyrm {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-struct SamplingParams {
-    interval_ms: u64,
 }
 
 type CallResult<T> = Result<Json<T>, String>;
