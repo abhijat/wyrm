@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, ensure};
 use rmcp::schemars;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(serde::Serialize, schemars::JsonSchema)]
+#[derive(Clone, Copy, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HeapKind {
     Data,
@@ -14,7 +14,7 @@ enum ArenaSection {
     Aggregate,
 }
 
-#[derive(Default, serde::Serialize, schemars::JsonSchema)]
+#[derive(Clone, Copy, Default, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct AllocStats {
     pub(crate) reserved_bytes: u64,
     pub(crate) committed_bytes: u64,
@@ -164,7 +164,7 @@ pub(crate) struct CompactArenaReport {
 }
 
 impl ArenaSnapshot {
-    pub(crate) fn compact_report(self) -> CompactArenaReport {
+    pub(crate) fn compact_report(&self) -> CompactArenaReport {
         let ranked_waste = rank_waste(&self.aggregate);
         let waste_class_count = ranked_waste.len();
         let mut top_waste_classes = ranked_waste;
@@ -176,6 +176,107 @@ impl ArenaSnapshot {
             top_waste_classes,
             waste_class_count,
         }
+    }
+
+    pub(crate) fn compare(&self, after: &Self) -> ArenaComparison {
+        compare_arenas(self, after)
+    }
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ArenaSizeClassChange {
+    pub(crate) block_size_bytes: u64,
+    pub(crate) committed_bytes_delta: i128,
+    pub(crate) used_bytes_delta: i128,
+    pub(crate) wasted_bytes_delta: i128,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct ArenaComparison {
+    pub(crate) committed_bytes_delta: i128,
+    pub(crate) used_bytes_delta: i128,
+    pub(crate) wasted_bytes_delta: i128,
+    pub(crate) reserved_bytes_delta: i128,
+    pub(crate) compared_size_class_count: usize,
+    pub(crate) top_waste_increases: Vec<ArenaSizeClassChange>,
+    pub(crate) waste_increase_class_count: usize,
+    pub(crate) waste_increases_truncated: bool,
+    pub(crate) top_waste_decreases: Vec<ArenaSizeClassChange>,
+    pub(crate) waste_decrease_class_count: usize,
+    pub(crate) waste_decreases_truncated: bool,
+}
+
+fn compare_arenas(before: &ArenaSnapshot, after: &ArenaSnapshot) -> ArenaComparison {
+    let delta = |before: u64, after: u64| i128::from(after) - i128::from(before);
+    let mut block_sizes = BTreeSet::new();
+    block_sizes.extend(before.aggregate.size_classes.keys().copied());
+    block_sizes.extend(after.aggregate.size_classes.keys().copied());
+
+    let mut changes = Vec::with_capacity(block_sizes.len());
+    for block_size_bytes in block_sizes.iter().copied() {
+        // These are complete parsed maps, so a missing size class means zero stats.
+        let before_stats = before
+            .aggregate
+            .size_classes
+            .get(&block_size_bytes)
+            .copied()
+            .unwrap_or_default();
+        let after_stats = after
+            .aggregate
+            .size_classes
+            .get(&block_size_bytes)
+            .copied()
+            .unwrap_or_default();
+        changes.push(ArenaSizeClassChange {
+            block_size_bytes,
+            committed_bytes_delta: delta(before_stats.committed_bytes, after_stats.committed_bytes),
+            used_bytes_delta: delta(before_stats.used_bytes, after_stats.used_bytes),
+            wasted_bytes_delta: delta(before_stats.wasted_bytes, after_stats.wasted_bytes),
+        });
+    }
+    let (mut increases, mut decreases): (Vec<_>, Vec<_>) = changes
+        .into_iter()
+        .filter(|change| change.wasted_bytes_delta != 0)
+        .partition(|change| change.wasted_bytes_delta > 0);
+    increases.sort_unstable_by(|a, b| {
+        b.wasted_bytes_delta
+            .cmp(&a.wasted_bytes_delta)
+            .then_with(|| a.block_size_bytes.cmp(&b.block_size_bytes))
+    });
+    decreases.sort_unstable_by(|a, b| {
+        a.wasted_bytes_delta
+            .cmp(&b.wasted_bytes_delta)
+            .then_with(|| a.block_size_bytes.cmp(&b.block_size_bytes))
+    });
+    let waste_increase_class_count = increases.len();
+    let waste_decrease_class_count = decreases.len();
+    increases.truncate(5);
+    decreases.truncate(5);
+
+    ArenaComparison {
+        committed_bytes_delta: delta(
+            before.aggregate.total.committed_bytes,
+            after.aggregate.total.committed_bytes,
+        ),
+        used_bytes_delta: delta(
+            before.aggregate.total.used_bytes,
+            after.aggregate.total.used_bytes,
+        ),
+        wasted_bytes_delta: delta(
+            before.aggregate.total.wasted_bytes,
+            after.aggregate.total.wasted_bytes,
+        ),
+        reserved_bytes_delta: delta(
+            before.aggregate.total.reserved_bytes,
+            after.aggregate.total.reserved_bytes,
+        ),
+        compared_size_class_count: block_sizes.len(),
+        waste_increases_truncated: waste_increase_class_count > increases.len(),
+        waste_decreases_truncated: waste_decrease_class_count > decreases.len(),
+        top_waste_increases: increases,
+        waste_increase_class_count,
+        top_waste_decreases: decreases,
+        waste_decrease_class_count,
     }
 }
 

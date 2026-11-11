@@ -1,13 +1,16 @@
-use crate::arena::{HeapKind, parse_arena_summary};
+use crate::arena::{ArenaSnapshot, HeapKind, parse_arena_summary};
 use crate::connection::parse_client_info;
 use crate::memory::{MemorySnapshot, parse_memory_info};
-use crate::memory_gap::{MemoryGapReport, SourceTiming};
+use crate::memory_gap::{
+    MemoryGapComparison, MemoryGapReport, MemoryGapToolResponse, SourceTiming,
+};
 use crate::metrics::MetricsCollector;
 use redis::aio::ConnectionManager;
 use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
-use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
-use tokio::time::Instant;
+use rmcp::{Json, ServerHandler, schemars, tool, tool_handler, tool_router};
+use tokio::time::{Duration, Instant, sleep};
 
 pub(crate) struct Wyrm {
     tool_router: ToolRouter<Self>,
@@ -51,9 +54,48 @@ impl Wyrm {
     }
 
     #[tool(
-        description = "Explain the RSS versus database memory gap from one sequential snapshot. Requires configured HTTP metrics and scans both arena heaps, which may be costly on large heaps."
+        description = "Explain the RSS versus database memory gap from one sequential snapshot, or compare two snapshots with interval_ms. A supplied interval must be 1000–10000 ms and is slept after the first collection, so actual elapsed time is longer. Requires configured HTTP metrics and scans both arena heaps, which may be costly on large heaps."
     )]
-    async fn explain_memory_gap(&self) -> CallResult<MemoryGapReport> {
+    async fn explain_memory_gap(
+        &self,
+        Parameters(MemoryGapParams { interval_ms }): Parameters<MemoryGapParams>,
+    ) -> CallResult<MemoryGapToolResponse> {
+        if let Some(interval_ms) = interval_ms
+            && !(1000..=10000).contains(&interval_ms)
+        {
+            return Err(format!(
+                "interval_ms must be between 1000 and 10000, got {interval_ms}"
+            ));
+        }
+
+        let before_start = Instant::now();
+        let before = self.collect_memory_gap().await?;
+        let Some(requested_interval_ms) = interval_ms else {
+            return Ok(Json(MemoryGapToolResponse {
+                snapshot: before.report,
+                comparison: None,
+            }));
+        };
+
+        sleep(Duration::from_millis(requested_interval_ms)).await;
+        let after_start = Instant::now();
+        let elapsed_ms = after_start.duration_since(before_start).as_secs_f64() * 1000.0;
+        let after = self.collect_memory_gap().await?;
+        let comparison = MemoryGapComparison::new(
+            before.report,
+            &after.report,
+            before.data_arena.compare(&after.data_arena),
+            before.backing_arena.compare(&after.backing_arena),
+            requested_interval_ms,
+            elapsed_ms,
+        );
+        Ok(Json(MemoryGapToolResponse {
+            snapshot: after.report,
+            comparison: Some(comparison),
+        }))
+    }
+
+    async fn collect_memory_gap(&self) -> Result<CollectedMemoryGap, String> {
         let metrics = self.metrics_collector.as_ref().ok_or_else(|| {
             "Failed to collect connection memory gauge: WYRM_METRICS_URL is not set up".to_owned()
         })?;
@@ -118,8 +160,7 @@ impl Wyrm {
             Instant::now(),
         ));
         let data_arena = parse_arena_summary(&raw, HeapKind::Data)
-            .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY: {err:#}"))?
-            .compact_report();
+            .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY: {err:#}"))?;
 
         let source_start = Instant::now();
         let raw = self
@@ -133,19 +174,34 @@ impl Wyrm {
             Instant::now(),
         ));
         let backing_arena = parse_arena_summary(&raw, HeapKind::Backing)
-            .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY BACKING: {err:#}"))?
-            .compact_report();
+            .map_err(|err| format!("Failed to parse MEMORY ARENA SUMMARY BACKING: {err:#}"))?;
 
-        Ok(Json(MemoryGapReport::new(
+        let report = MemoryGapReport::new(
             memory,
             clients,
             direct_connection_estimate_bytes,
-            data_arena,
-            backing_arena,
+            data_arena.compact_report(),
+            backing_arena.compact_report(),
             sources,
             collected_at_unix_ms,
-        )))
+        );
+        Ok(CollectedMemoryGap {
+            report,
+            data_arena,
+            backing_arena,
+        })
     }
+}
+
+struct CollectedMemoryGap {
+    report: MemoryGapReport,
+    data_arena: ArenaSnapshot,
+    backing_arena: ArenaSnapshot,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct MemoryGapParams {
+    interval_ms: Option<u64>,
 }
 
 fn source_timing(
