@@ -1,6 +1,6 @@
 use crate::arena::{ArenaComparison, CompactArenaReport};
 use crate::connection::ConnectionSnapshot;
-use crate::memory::MemorySnapshot;
+use crate::memory::{MemoryConsumers, MemorySnapshot};
 use rmcp::schemars;
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -23,6 +23,8 @@ pub(crate) struct MemoryGapReport {
     pub(crate) connected_clients: Option<u64>,
     pub(crate) direct_connection_estimate_bytes: Option<u64>,
     pub(crate) client_read_buffer_capacity_bytes: Option<u64>,
+    pub(crate) named_consumers: MemoryConsumers,
+    pub(crate) ranked_consumers: Vec<RankedMemoryConsumer>,
     pub(crate) data_arena: CompactArenaReport,
     pub(crate) backing_arena: CompactArenaReport,
     pub(crate) findings: Vec<String>,
@@ -48,6 +50,7 @@ pub(crate) struct MemoryGapComparison {
     pub(crate) connected_clients_delta: Option<i128>,
     pub(crate) direct_connection_estimate_bytes_delta: Option<i128>,
     pub(crate) client_read_buffer_capacity_bytes_delta: Option<i128>,
+    pub(crate) named_consumers_delta: NamedConsumerDeltas,
     pub(crate) data_arena: ArenaComparison,
     pub(crate) backing_arena: ArenaComparison,
     pub(crate) sampling: MemoryGapSampling,
@@ -86,6 +89,8 @@ impl MemoryGapComparison {
             before.client_read_buffer_capacity_bytes,
             after.client_read_buffer_capacity_bytes,
         );
+        let named_consumers_delta =
+            NamedConsumerDeltas::between(before.named_consumers, after.named_consumers);
 
         let mut findings = Vec::new();
         for (name, unit, delta) in [
@@ -112,6 +117,9 @@ impl MemoryGapComparison {
                 findings.push(format!("{name} changed by {delta} {unit}"));
             }
         }
+        for (name, delta) in named_consumers_delta.nonzero_fields() {
+            findings.push(format!("{name} changed by {delta} bytes"));
+        }
         for (name, arena) in [("data", &data_arena), ("backing", &backing_arena)] {
             if arena.wasted_bytes_delta != 0 {
                 findings.push(format!(
@@ -136,6 +144,7 @@ impl MemoryGapComparison {
             "intermediate sampling runs during the requested observation window; actual start-to-start elapsed time can be longer because collection takes time".to_owned(),
             "finite intermediate samples cannot establish the continuous peak or rule out churn between observations".to_owned(),
             "each endpoint is sequential and not an atomic snapshot".to_owned(),
+            "the eight additional INFO MEMORY consumers have endpoint values and deltas only; intermediate sampling ranges do not include them".to_owned(),
             "observed changes do not establish that connection changes caused RSS changes or that defragmentation caused allocator changes".to_owned(),
         ];
         if rss_bytes_delta.is_none() {
@@ -159,12 +168,80 @@ impl MemoryGapComparison {
             connected_clients_delta,
             direct_connection_estimate_bytes_delta,
             client_read_buffer_capacity_bytes_delta,
+            named_consumers_delta,
             data_arena,
             backing_arena,
             sampling,
             findings,
             limitations,
         }
+    }
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct RankedMemoryConsumer {
+    pub(crate) name: String,
+    pub(crate) bytes: u64,
+    pub(crate) source: String,
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct NamedConsumerDeltas {
+    pub(crate) pipeline_cache_bytes: Option<i128>,
+    pub(crate) dispatch_queue_bytes: Option<i128>,
+    pub(crate) pipeline_queue_bytes: Option<i128>,
+    pub(crate) used_memory_lua: Option<i128>,
+    pub(crate) tls_bytes: Option<i128>,
+    pub(crate) replication_streaming_buffer_bytes: Option<i128>,
+    pub(crate) replication_full_sync_buffer_bytes: Option<i128>,
+    pub(crate) psync_buffer_bytes: Option<i128>,
+}
+
+impl NamedConsumerDeltas {
+    fn between(before: MemoryConsumers, after: MemoryConsumers) -> Self {
+        let delta = |before: Option<u64>, after: Option<u64>| {
+            before
+                .zip(after)
+                .map(|(before, after)| i128::from(after) - i128::from(before))
+        };
+        Self {
+            pipeline_cache_bytes: delta(before.pipeline_cache_bytes, after.pipeline_cache_bytes),
+            dispatch_queue_bytes: delta(before.dispatch_queue_bytes, after.dispatch_queue_bytes),
+            pipeline_queue_bytes: delta(before.pipeline_queue_bytes, after.pipeline_queue_bytes),
+            used_memory_lua: delta(before.used_memory_lua, after.used_memory_lua),
+            tls_bytes: delta(before.tls_bytes, after.tls_bytes),
+            replication_streaming_buffer_bytes: delta(
+                before.replication_streaming_buffer_bytes,
+                after.replication_streaming_buffer_bytes,
+            ),
+            replication_full_sync_buffer_bytes: delta(
+                before.replication_full_sync_buffer_bytes,
+                after.replication_full_sync_buffer_bytes,
+            ),
+            psync_buffer_bytes: delta(before.psync_buffer_bytes, after.psync_buffer_bytes),
+        }
+    }
+
+    fn nonzero_fields(&self) -> Vec<(&'static str, i128)> {
+        [
+            ("pipeline_cache_bytes", self.pipeline_cache_bytes),
+            ("dispatch_queue_bytes", self.dispatch_queue_bytes),
+            ("pipeline_queue_bytes", self.pipeline_queue_bytes),
+            ("used_memory_lua", self.used_memory_lua),
+            ("tls_bytes", self.tls_bytes),
+            (
+                "replication_streaming_buffer_bytes",
+                self.replication_streaming_buffer_bytes,
+            ),
+            (
+                "replication_full_sync_buffer_bytes",
+                self.replication_full_sync_buffer_bytes,
+            ),
+            ("psync_buffer_bytes", self.psync_buffer_bytes),
+        ]
+        .into_iter()
+        .filter_map(|(name, delta)| delta.filter(|delta| *delta != 0).map(|delta| (name, delta)))
+        .collect()
     }
 }
 
@@ -358,6 +435,7 @@ impl MemoryGapReport {
     ) -> Self {
         let rss_bytes = memory.used_memory_rss;
         let db_used_bytes = memory.used_memory;
+        let named_consumers = memory.named_consumers;
         // Convert before subtracting: RSS can be lower than accounted allocations.
         let rss_minus_db_used_bytes = rss_bytes
             .zip(db_used_bytes)
@@ -375,6 +453,20 @@ impl MemoryGapReport {
         if let Some(bytes) = direct_connection_estimate_bytes {
             findings.push(format!(
                 "HTTP connection memory estimate reports {bytes} bytes"
+            ));
+        }
+        let ranked_consumers = rank_consumers(
+            named_consumers,
+            direct_connection_estimate_bytes,
+            client_read_buffer_capacity_bytes,
+        );
+        if let Some(consumer) = ranked_consumers
+            .first()
+            .filter(|consumer| consumer.bytes > 0)
+        {
+            findings.push(format!(
+                "largest available named memory consumer is {} at {} bytes",
+                consumer.name, consumer.bytes
             ));
         }
         if backing_arena.total.wasted_bytes > 0 {
@@ -398,6 +490,7 @@ impl MemoryGapReport {
             "client read-buffer capacity includes shared and private buffers".to_owned(),
             "DB used memory and allocator totals can overlap and must not be added as independent components".to_owned(),
             "allocation estimates and buffer capacities are not measurements of their resident contribution to RSS".to_owned(),
+            "ranked consumers repeat named fields and connection estimates elsewhere in this report; do not add the ranking to those views".to_owned(),
         ];
         if rss_bytes.is_none() {
             limitations.push("INFO MEMORY did not provide used_memory_rss".to_owned());
@@ -415,6 +508,11 @@ impl MemoryGapReport {
             limitations
                 .push("HTTP metrics did not provide dragonfly_connection_memory_bytes".to_owned());
         }
+        if named_consumers.has_missing_fields() {
+            limitations.push(
+                "some named INFO MEMORY consumer fields are unavailable; those fields are null and excluded from the ranking".to_owned(),
+            );
+        }
         Self {
             collected_at_unix_ms,
             sources,
@@ -425,10 +523,90 @@ impl MemoryGapReport {
             connected_clients,
             direct_connection_estimate_bytes,
             client_read_buffer_capacity_bytes,
+            named_consumers,
+            ranked_consumers,
             data_arena,
             backing_arena,
             findings,
             limitations,
         }
     }
+}
+
+impl MemoryConsumers {
+    fn has_missing_fields(&self) -> bool {
+        self.pipeline_cache_bytes.is_none()
+            || self.dispatch_queue_bytes.is_none()
+            || self.pipeline_queue_bytes.is_none()
+            || self.used_memory_lua.is_none()
+            || self.tls_bytes.is_none()
+            || self.replication_streaming_buffer_bytes.is_none()
+            || self.replication_full_sync_buffer_bytes.is_none()
+            || self.psync_buffer_bytes.is_none()
+    }
+}
+
+fn rank_consumers(
+    consumers: MemoryConsumers,
+    direct_connection_estimate_bytes: Option<u64>,
+    client_read_buffer_capacity_bytes: Option<u64>,
+) -> Vec<RankedMemoryConsumer> {
+    let mut ranked = Vec::new();
+    let mut add = |name: &str, bytes: Option<u64>, source: &str| {
+        if let Some(bytes) = bytes {
+            ranked.push(RankedMemoryConsumer {
+                name: name.to_owned(),
+                bytes,
+                source: source.to_owned(),
+            });
+        }
+    };
+    add(
+        "pipeline_cache_bytes",
+        consumers.pipeline_cache_bytes,
+        "INFO MEMORY pipeline_cache_bytes",
+    );
+    add(
+        "dispatch_queue_bytes",
+        consumers.dispatch_queue_bytes,
+        "INFO MEMORY dispatch_queue_bytes",
+    );
+    add(
+        "pipeline_queue_bytes",
+        consumers.pipeline_queue_bytes,
+        "INFO MEMORY pipeline_queue_bytes",
+    );
+    add(
+        "used_memory_lua",
+        consumers.used_memory_lua,
+        "INFO MEMORY used_memory_lua",
+    );
+    add("tls_bytes", consumers.tls_bytes, "INFO MEMORY tls_bytes");
+    add(
+        "replication_streaming_buffer_bytes",
+        consumers.replication_streaming_buffer_bytes,
+        "INFO MEMORY replication_streaming_buffer_bytes",
+    );
+    add(
+        "replication_full_sync_buffer_bytes",
+        consumers.replication_full_sync_buffer_bytes,
+        "INFO MEMORY replication_full_sync_buffer_bytes",
+    );
+    add(
+        "psync_buffer_bytes",
+        consumers.psync_buffer_bytes,
+        "INFO MEMORY psync_buffer_bytes",
+    );
+    add(
+        "direct_connection_estimate_bytes",
+        direct_connection_estimate_bytes,
+        "HTTP dragonfly_connection_memory_bytes",
+    );
+    add(
+        "client_read_buffer_capacity_bytes",
+        client_read_buffer_capacity_bytes,
+        "INFO CLIENTS client_read_buffer_bytes",
+    );
+    ranked.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    ranked
 }

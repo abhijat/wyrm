@@ -6,6 +6,7 @@ use server::Wyrm;
 use std::env;
 
 mod arena;
+mod command_catalog;
 mod connection;
 mod memory;
 mod memory_gap;
@@ -22,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|url| MetricsCollector::new(&url))
         .transpose()?;
-    let service = Wyrm::new(connection, metrics).serve(stdio()).await?;
+    let service = Wyrm::new(connection, metrics)?.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

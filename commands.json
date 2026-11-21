@@ -1,0 +1,23 @@
+[
+  {
+    "name": "dragonfly_get",
+    "description": "Get the value stored at a key.",
+    "command": "GET",
+    "parameters": [{"name": "key", "type": "string"}]
+  },
+  {
+    "name": "dragonfly_hget",
+    "description": "Get a field value from a hash.",
+    "command": "HGET",
+    "parameters": [
+      {"name": "key", "type": "string"},
+      {"name": "field", "type": "string"}
+    ]
+  },
+  {
+    "name": "dragonfly_mget",
+    "description": "Get values for multiple keys, preserving input order.",
+    "command": "MGET",
+    "parameters": [{"name": "keys", "type": "string_array"}]
+  }
+]

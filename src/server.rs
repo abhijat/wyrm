@@ -1,4 +1,5 @@
 use crate::arena::{ArenaSnapshot, HeapKind, parse_arena_summary};
+use crate::command_catalog;
 use crate::connection::{ConnectionSnapshot, parse_client_info};
 use crate::memory::{MemorySnapshot, parse_memory_info};
 use crate::memory_gap::{
@@ -24,12 +25,14 @@ impl Wyrm {
     pub(crate) fn new(
         connection: ConnectionManager,
         metrics_collector: Option<MetricsCollector>,
-    ) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
+    ) -> anyhow::Result<Self> {
+        let mut tool_router = Self::tool_router();
+        tool_router.merge(command_catalog::build_routes(connection.clone())?);
+        Ok(Self {
+            tool_router,
             connection,
             metrics_collector,
-        }
+        })
     }
 
     async fn run_command(&self, cmd: &str) -> anyhow::Result<String> {
@@ -333,7 +336,7 @@ fn source_timing(
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Wyrm {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
